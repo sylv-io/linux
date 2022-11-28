@@ -509,31 +509,42 @@ static ssize_t read_iter_zero(struct kiocb *iocb, struct iov_iter *iter)
 	return written;
 }
 
+static ssize_t read_iter_one(struct kiocb *iocb, struct iov_iter *iter)
+{
+	size_t written = 0;
+
+	while (iov_iter_count(iter)) {
+		size_t chunk = iov_iter_count(iter), n;
+
+		if (chunk > PAGE_SIZE)
+			chunk = PAGE_SIZE;	/* Just for latency reasons */
+		n = iov_iter_zero(chunk, iter);
+		if (!n && iov_iter_count(iter))
+			return written ? written : -EFAULT;
+		written += n;
+		if (signal_pending(current))
+			return written ? written : -ERESTARTSYS;
+		if (!need_resched())
+			continue;
+		if (iocb->ki_flags & IOCB_NOWAIT)
+			return written ? written : -EAGAIN;
+		cond_resched();
+	}
+	return written;
+}
+
 static ssize_t read_zero(struct file *file, char __user *buf,
 			 size_t count, loff_t *ppos)
 {
-	size_t cleared = 0;
+	memset(buf, 0x00, count);
+	return count;
+}
 
-	while (count) {
-		size_t chunk = min_t(size_t, count, PAGE_SIZE);
-		size_t left;
-
-		left = clear_user(buf + cleared, chunk);
-		if (unlikely(left)) {
-			cleared += (chunk - left);
-			if (!cleared)
-				return -EFAULT;
-			break;
-		}
-		cleared += chunk;
-		count -= chunk;
-
-		if (signal_pending(current))
-			break;
-		cond_resched();
-	}
-
-	return cleared;
+static ssize_t read_one(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	memset(buf, 0xff, count);
+	return count;
 }
 
 static int mmap_zero(struct file *file, struct vm_area_struct *vma)
@@ -691,6 +702,19 @@ static const struct file_operations zero_fops = {
 #endif
 };
 
+static const struct file_operations one_fops = {
+	.llseek		= zero_lseek,
+	.write		= write_zero,
+	.read_iter	= read_iter_one,
+	.read		= read_one,
+	.write_iter	= write_iter_zero,
+	.mmap		= mmap_zero,
+	.get_unmapped_area = get_unmapped_area_zero,
+#ifndef CONFIG_MMU
+	.mmap_capabilities = zero_mmap_capabilities,
+#endif
+};
+
 static const struct file_operations full_fops = {
 	.llseek		= full_lseek,
 	.read_iter	= read_iter_zero,
@@ -711,6 +735,7 @@ static const struct memdev {
 	 [4] = { "port", 0, &port_fops, 0 },
 #endif
 	 [5] = { "zero", 0666, &zero_fops, FMODE_NOWAIT },
+	 [6] = { "one", 0666, &one_fops, FMODE_NOWAIT },
 	 [7] = { "full", 0666, &full_fops, 0 },
 	 [8] = { "random", 0666, &random_fops, 0 },
 	 [9] = { "urandom", 0666, &urandom_fops, 0 },
